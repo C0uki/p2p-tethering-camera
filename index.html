@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>P2P FHD テザリングカメラ</title>
+    <script src="https://unpkg.com/peerjs@1.5.2/dist/peerjs.min.js"></script>
+    <style>
+        body { font-family: 'Helvetica Neue', Arial, sans-serif; background: #2c3e50; color: #ecf0f1; margin: 0; padding: 20px; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .panel { background: #34495e; padding: 20px; border-radius: 10px; margin-bottom: 20px; box-shadow: 0 4px 6px rgba(0,0,0,0.3); }
+        h1, h2 { text-align: center; margin-top: 0; }
+        video { width: 100%; max-height: 70vh; background: #000; border-radius: 8px; object-fit: contain; }
+        button { background: #3498db; color: white; border: none; padding: 15px; border-radius: 5px; cursor: pointer; font-size: 16px; width: 100%; margin-bottom: 10px; font-weight: bold; transition: background 0.2s; }
+        button:hover:not(:disabled) { filter: brightness(1.1); }
+        button:disabled { background: #7f8c8d; cursor: not-allowed; }
+        button.danger { background: #e74c3c; }
+        input[type="text"] { padding: 12px; font-size: 16px; width: calc(100% - 24px); border-radius: 5px; border: none; margin-bottom: 10px; text-align: center; }
+        .highlight { color: #f1c40f; font-weight: bold; font-size: 1.5em; text-align: center; display: block; margin: 10px 0; user-select: all; letter-spacing: 2px; }
+        .status-bar {
+            text-align: center;
+            font-size: 0.9em;
+            padding: 8px 12px;
+            border-radius: 5px;
+            margin-bottom: 10px;
+            transition: all 0.3s;
+        }
+        .status-bar.info    { background: #2980b9; color: #fff; }
+        .status-bar.success { background: #27ae60; color: #fff; }
+        .status-bar.error   { background: #c0392b; color: #fff; }
+        .status-bar.warning { background: #f39c12; color: #fff; }
+        .id-row { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+        .id-row .highlight { flex: 1; margin: 0; }
+        .id-row button { width: auto; padding: 10px 16px; font-size: 14px; margin: 0; }
+        .note { text-align: center; font-size: 0.85em; color: #bdc3c7; margin-top: 0; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>P2P テザリングカメラ</h1>
+    <p class="note">※スマホのテザリングに繋いで使用するとギガを消費しません。</p>
+
+    <!-- 初期画面（役割選択） -->
+    <div id="setup-ui" class="panel">
+        <button id="btn-receiver" onclick="startReceiver()">1. 受信者になる（パソコン等）</button>
+        <button id="btn-sender" onclick="startSender()" class="danger">2. 送信者になる（スマホ）</button>
+    </div>
+
+    <!-- 受信者用UI -->
+    <div id="receiver-ui" class="panel" style="display:none;">
+        <h2>📺 受信モニター</h2>
+        <p class="note">このIDをスマホに入力してください</p>
+        <div class="id-row">
+            <span id="my-id" class="highlight">取得中...</span>
+            <button onclick="copyId()" id="btn-copy" disabled>コピー</button>
+        </div>
+        <div id="receiver-status" class="status-bar info">スマホからの接続を待っています...</div>
+        <video id="remote-video" autoplay playsinline controls></video>
+        <button onclick="resetApp()" class="danger" style="margin-top:10px;">最初に戻る</button>
+    </div>
+
+    <!-- 送信者用UI -->
+    <div id="sender-ui" class="panel" style="display:none;">
+        <h2>📱 スマホカメラ（送信）</h2>
+        <div id="sender-status" class="status-bar info">カメラを起動中...</div>
+        <input type="text" id="receiver-id-input" placeholder="受信者のIDを入力">
+        <button id="btn-send" onclick="connectAndSend()" style="background:#2ecc71;" disabled>映像を送信スタート</button>
+        <button id="btn-disconnect" onclick="disconnectCall()" class="danger" style="display:none;">切断する</button>
+        <video id="local-video" autoplay muted playsinline></video>
+        <button onclick="resetApp()" class="danger" style="margin-top:10px;">最初に戻る</button>
+    </div>
+</div>
+
+<script>
+    let peer = null;
+    let localStream = null;
+    let activeCall = null;
+
+    // ───────────────────────────────
+    // ユーティリティ
+    // ───────────────────────────────
+    function setStatus(elementId, message, type = 'info') {
+        const el = document.getElementById(elementId);
+        el.textContent = message;
+        el.className = `status-bar ${type}`;
+    }
+
+    function hideSetup() {
+        document.getElementById('setup-ui').style.display = 'none';
+    }
+
+    function resetApp() {
+        // ストリームとピア接続を完全にクリーンアップ
+        if (activeCall) { activeCall.close(); activeCall = null; }
+        if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+        if (peer) { peer.destroy(); peer = null; }
+
+        document.getElementById('receiver-ui').style.display = 'none';
+        document.getElementById('sender-ui').style.display = 'none';
+        document.getElementById('setup-ui').style.display = 'block';
+
+        // 各ビデオ要素をクリア
+        ['remote-video', 'local-video'].forEach(id => {
+            const v = document.getElementById(id);
+            v.srcObject = null;
+        });
+        document.getElementById('btn-send').disabled = true;
+        document.getElementById('btn-disconnect').style.display = 'none';
+    }
+
+    // ───────────────────────────────
+    // 1. 受信者（パソコン）側
+    // ───────────────────────────────
+    function startReceiver() {
+        hideSetup();
+        document.getElementById('receiver-ui').style.display = 'block';
+
+        peer = new Peer();
+
+        peer.on('open', (id) => {
+            document.getElementById('my-id').textContent = id;
+            document.getElementById('btn-copy').disabled = false;
+            setStatus('receiver-status', 'スマホからの接続を待っています...', 'info');
+        });
+
+        peer.on('call', (call) => {
+            activeCall = call;
+            setStatus('receiver-status', '接続中...', 'warning');
+
+            call.answer(); // 受信専用なので映像なしで応答
+
+            call.on('stream', (remoteStream) => {
+                const video = document.getElementById('remote-video');
+                video.srcObject = remoteStream;
+                setStatus('receiver-status', '✅ 受信中', 'success');
+            });
+
+            call.on('close', () => {
+                setStatus('receiver-status', '接続が切断されました。スマホから再接続してください。', 'warning');
+                document.getElementById('remote-video').srcObject = null;
+            });
+
+            call.on('error', (err) => {
+                setStatus('receiver-status', '❌ エラー: ' + err.message, 'error');
+            });
+        });
+
+        peer.on('error', (err) => {
+            setStatus('receiver-status', '❌ Peerエラー: ' + err.type, 'error');
+        });
+
+        peer.on('disconnected', () => {
+            setStatus('receiver-status', '⚠️ サーバーから切断されました。再接続を試みています...', 'warning');
+            peer.reconnect();
+        });
+    }
+
+    function copyId() {
+        const id = document.getElementById('my-id').textContent;
+        navigator.clipboard.writeText(id).then(() => {
+            const btn = document.getElementById('btn-copy');
+            btn.textContent = 'コピー済！';
+            setTimeout(() => { btn.textContent = 'コピー'; }, 2000);
+        }).catch(() => {
+            // clipboard APIが使えない場合のフォールバック
+            const range = document.createRange();
+            range.selectNode(document.getElementById('my-id'));
+            window.getSelection().removeAllRanges();
+            window.getSelection().addRange(range);
+        });
+    }
+
+    // ───────────────────────────────
+    // 2. 送信者（スマホ）側
+    // ───────────────────────────────
+    async function startSender() {
+        hideSetup();
+        document.getElementById('sender-ui').style.display = 'block';
+        setStatus('sender-status', 'カメラを起動中...', 'info');
+
+        // PeerJSの初期化
+        peer = new Peer();
+        peer.on('error', (err) => {
+            setStatus('sender-status', '❌ Peerエラー: ' + err.type, 'error');
+        });
+        peer.on('disconnected', () => {
+            setStatus('sender-status', '⚠️ サーバーから切断。再接続中...', 'warning');
+            peer.reconnect();
+        });
+
+        // カメラ起動
+        try {
+            localStream = await navigator.mediaDevices.getUserMedia({
+                video: {
+                    width:     { ideal: 1920 },
+                    height:    { ideal: 1080 },
+                    frameRate: { ideal: 30 },
+                    facingMode: 'environment'
+                },
+                audio: true
+            });
+            document.getElementById('local-video').srcObject = localStream;
+            document.getElementById('btn-send').disabled = false;
+            setStatus('sender-status', 'カメラ起動完了。受信者のIDを入力して送信してください。', 'success');
+        } catch (err) {
+            setStatus('sender-status', '❌ カメラ起動失敗: ' + err.message, 'error');
+            // ボタンは disabled のまま維持
+        }
+    }
+
+    function connectAndSend() {
+        const receiverId = document.getElementById('receiver-id-input').value.trim();
+        if (!receiverId) {
+            setStatus('sender-status', '⚠️ 受信者のIDを入力してください。', 'warning');
+            return;
+        }
+        if (!localStream) {
+            setStatus('sender-status', '❌ カメラが起動していません。', 'error');
+            return;
+        }
+
+        // PeerがまだOpenでない場合は待機してから接続
+        const doCall = () => {
+            setStatus('sender-status', '接続中...', 'warning');
+            document.getElementById('btn-send').disabled = true;
+
+            activeCall = peer.call(receiverId, localStream);
+
+            activeCall.on('stream', () => {
+                // 受信者側のストリームは不要だが、接続確立の確認に使う
+                setStatus('sender-status', '✅ 送信中', 'success');
+                document.getElementById('btn-disconnect').style.display = 'block';
+            });
+
+            activeCall.on('close', () => {
+                setStatus('sender-status', '接続が切断されました。', 'warning');
+                document.getElementById('btn-disconnect').style.display = 'none';
+                document.getElementById('btn-send').disabled = false;
+                activeCall = null;
+            });
+
+            activeCall.on('error', (err) => {
+                setStatus('sender-status', '❌ 接続エラー: ' + err.message, 'error');
+                document.getElementById('btn-disconnect').style.display = 'none';
+                document.getElementById('btn-send').disabled = false;
+                activeCall = null;
+            });
+        };
+
+        if (peer.open) {
+            doCall();
+        } else {
+            setStatus('sender-status', 'サーバーへの接続を待っています...', 'info');
+            peer.once('open', doCall);
+        }
+    }
+
+    function disconnectCall() {
+        if (activeCall) {
+            activeCall.close();
+            activeCall = null;
+        }
+        setStatus('sender-status', '切断しました。再度送信できます。', 'info');
+        document.getElementById('btn-disconnect').style.display = 'none';
+        document.getElementById('btn-send').disabled = false;
+    }
+</script>
+</body>
+</html>
